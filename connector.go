@@ -2,11 +2,15 @@ package beakwecom
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -20,7 +24,11 @@ const (
 	credentialValidationTimeout = 10 * time.Second
 	streamRequestTimeout        = 10 * time.Second
 	maxTrackedInbound           = 4096
+	maxTrackedOutboundProgress  = 256
+	outboundChunkProgressKey    = "outbound_chunk_progress"
 )
+
+var outboundSendLocks [64]sync.Mutex
 
 var ErrCredentialLogin = errors.New("wecom connector uses credential login; create channel account from CredentialSchema")
 
@@ -281,8 +289,30 @@ func (Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbound
 	}
 
 	chunks := splitUTF8(req.Text, platform.MaxMarkdownBytes)
-	messageIDs := make([]string, 0, len(chunks))
-	for _, chunk := range chunks {
+	if len(chunks) > 1 && strings.TrimSpace(req.MessageUUID) == "" {
+		return nil, fmt.Errorf("wecom multipart outbound requires message_uuid for retry-safe delivery")
+	}
+	if len(chunks) > 1 && runtime.AccountStore == nil {
+		return nil, fmt.Errorf("wecom multipart outbound requires sdk.Runtime.AccountStore for retry-safe delivery")
+	}
+	progressEntries := map[string]any{}
+	progress := outboundChunkProgress{}
+	if len(chunks) > 1 {
+		lock := outboundSendLock(accountUUID)
+		lock.Lock()
+		defer lock.Unlock()
+
+		progressEntries, progress, err = loadOutboundChunkProgress(ctx, runtime, account, req, chunks)
+		if err != nil {
+			return nil, err
+		}
+		if progress.Completed {
+			return wecomSendResult(accountUUID, progress.MessageIDs, len(chunks)), nil
+		}
+	}
+	messageIDs := append([]string(nil), progress.MessageIDs...)
+	for index := progress.NextIndex; index < len(chunks); index++ {
+		chunk := chunks[index]
 		requestID, err := platform.NewRequestID(platform.CommandSendMessage)
 		if err != nil {
 			return nil, err
@@ -313,18 +343,197 @@ func (Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbound
 			return nil, fmt.Errorf("wecom send message failed: code=%d message=%s", ack.ErrCode, strings.TrimSpace(ack.ErrMsg))
 		}
 		messageIDs = append(messageIDs, firstString(ack.Body["msgid"], requestID))
+		if progress.Key != "" {
+			progress.NextIndex = index + 1
+			progress.MessageIDs = append([]string(nil), messageIDs...)
+			progress.Completed = progress.NextIndex == len(chunks)
+			progress.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			progressEntries[progress.Key] = encodeOutboundChunkProgress(progress)
+			pruneOutboundChunkProgress(progressEntries, maxTrackedOutboundProgress)
+			patch := map[string]any{outboundChunkProgressKey: encodeOutboundChunkProgressEntries(progressEntries)}
+			if err := saveAccountState(ctx, runtime, accountUUID, patch); err != nil {
+				return nil, fmt.Errorf("wecom persist send progress after chunk %d/%d: %w", index+1, len(chunks), err)
+			}
+		}
 	}
-	return &sdk.SendResult{
+	return wecomSendResult(accountUUID, messageIDs, len(chunks)), nil
+}
+
+func wecomSendResult(accountUUID string, messageIDs []string, chunkCount int) *sdk.SendResult {
+	result := &sdk.SendResult{
 		Platform:    Platform,
 		AccountUUID: accountUUID,
-		MessageID:   messageIDs[len(messageIDs)-1],
 		Raw: map[string]any{
-			"message_ids":     messageIDs,
+			"message_ids":     append([]string(nil), messageIDs...),
 			"delivery_method": "host_stream",
 			"msg_type":        "markdown",
-			"chunk_count":     len(chunks),
+			"chunk_count":     chunkCount,
 		},
-	}, nil
+	}
+	if len(messageIDs) > 0 {
+		result.MessageID = messageIDs[len(messageIDs)-1]
+	}
+	return result
+}
+
+type outboundChunkProgress struct {
+	Key         string
+	Fingerprint string
+	NextIndex   int
+	MessageIDs  []string
+	Completed   bool
+	UpdatedAt   string
+}
+
+func loadOutboundChunkProgress(ctx context.Context, runtime sdk.Runtime, account sdk.ChannelAccount, req sdk.OutboundMessage, chunks []string) (map[string]any, outboundChunkProgress, error) {
+	progress := outboundChunkProgress{Key: strings.TrimSpace(req.MessageUUID), Fingerprint: outboundMessageFingerprint(accountKey(account), req, chunks)}
+	state, err := loadAccountState(ctx, runtime, account)
+	if err != nil {
+		return nil, outboundChunkProgress{}, err
+	}
+	entries := decodeOutboundChunkProgressEntries(state[outboundChunkProgressKey])
+	storedValue, exists := entries[progress.Key]
+	if !exists {
+		return entries, progress, nil
+	}
+	stored := decodeOutboundChunkProgress(progress.Key, storedValue)
+	if stored.Fingerprint != progress.Fingerprint {
+		return nil, outboundChunkProgress{}, fmt.Errorf("wecom message_uuid %s was already used for a different outbound payload", progress.Key)
+	}
+	if stored.NextIndex < 0 || stored.NextIndex > len(chunks) || len(stored.MessageIDs) != stored.NextIndex {
+		return nil, outboundChunkProgress{}, fmt.Errorf("wecom outbound progress for message_uuid %s is invalid", progress.Key)
+	}
+	stored.Key = progress.Key
+	stored.Completed = stored.NextIndex == len(chunks) && len(stored.MessageIDs) > 0
+	return entries, stored, nil
+}
+
+func outboundMessageFingerprint(accountUUID string, req sdk.OutboundMessage, chunks []string) string {
+	value, _ := json.Marshal(struct {
+		AccountUUID string   `json:"account_uuid"`
+		ChatType    string   `json:"chat_type"`
+		ChatID      string   `json:"chat_id"`
+		Chunks      []string `json:"chunks"`
+	}{
+		AccountUUID: strings.TrimSpace(accountUUID),
+		ChatType:    strings.TrimSpace(req.ChatType),
+		ChatID:      strings.TrimSpace(req.ChatID),
+		Chunks:      chunks,
+	})
+	sum := sha256.Sum256(value)
+	return hex.EncodeToString(sum[:])
+}
+
+func encodeOutboundChunkProgress(progress outboundChunkProgress) map[string]any {
+	messageIDs := make([]any, 0, len(progress.MessageIDs))
+	for _, messageID := range progress.MessageIDs {
+		messageIDs = append(messageIDs, messageID)
+	}
+	return map[string]any{
+		"fingerprint": progress.Fingerprint,
+		"next_index":  progress.NextIndex,
+		"message_ids": messageIDs,
+		"completed":   progress.Completed,
+		"updated_at":  progress.UpdatedAt,
+	}
+}
+
+func decodeOutboundChunkProgress(key string, value any) outboundChunkProgress {
+	raw := mapValue(value)
+	progress := outboundChunkProgress{
+		Key:         key,
+		Fingerprint: strings.TrimSpace(stringValue(raw["fingerprint"])),
+		NextIndex:   intValue(raw["next_index"]),
+		Completed:   boolValue(raw["completed"]),
+		UpdatedAt:   strings.TrimSpace(stringValue(raw["updated_at"])),
+	}
+	switch values := raw["message_ids"].(type) {
+	case []any:
+		for _, value := range values {
+			if messageID := strings.TrimSpace(stringValue(value)); messageID != "" {
+				progress.MessageIDs = append(progress.MessageIDs, messageID)
+			}
+		}
+	case []string:
+		for _, value := range values {
+			if messageID := strings.TrimSpace(value); messageID != "" {
+				progress.MessageIDs = append(progress.MessageIDs, messageID)
+			}
+		}
+	}
+	return progress
+}
+
+func decodeOutboundChunkProgressEntries(value any) map[string]any {
+	entries := map[string]any{}
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			entries[key] = item
+		}
+	case map[string]string:
+		for key, item := range typed {
+			entries[key] = item
+		}
+	case []any:
+		for _, item := range typed {
+			raw := mapValue(item)
+			key := strings.TrimSpace(stringValue(raw["message_uuid"]))
+			if key == "" {
+				continue
+			}
+			delete(raw, "message_uuid")
+			entries[key] = raw
+		}
+	case []map[string]any:
+		for _, item := range typed {
+			raw := cloneMap(item)
+			key := strings.TrimSpace(stringValue(raw["message_uuid"]))
+			if key == "" {
+				continue
+			}
+			delete(raw, "message_uuid")
+			entries[key] = raw
+		}
+	}
+	return entries
+}
+
+func encodeOutboundChunkProgressEntries(entries map[string]any) []any {
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	encoded := make([]any, 0, len(keys))
+	for _, key := range keys {
+		entry := mapValue(entries[key])
+		entry["message_uuid"] = key
+		encoded = append(encoded, entry)
+	}
+	return encoded
+}
+
+func pruneOutboundChunkProgress(entries map[string]any, limit int) {
+	if limit <= 0 || len(entries) <= limit {
+		return
+	}
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return stringValue(mapValue(entries[keys[i]])["updated_at"]) < stringValue(mapValue(entries[keys[j]])["updated_at"])
+	})
+	for len(entries) > limit {
+		delete(entries, keys[0])
+		keys = keys[1:]
+	}
+}
+
+func outboundSendLock(accountUUID string) *sync.Mutex {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(accountUUID)))
+	return &outboundSendLocks[int(sum[0])%len(outboundSendLocks)]
 }
 
 func (Connector) Acknowledge(_ context.Context, _ sdk.Runtime, req sdk.OutboundAck) (*sdk.AckResult, error) {
@@ -454,6 +663,26 @@ func mapValue(value any) map[string]any {
 		return out
 	default:
 		return map[string]any{}
+	}
+}
+
+func intValue(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	case float32:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return int(parsed)
+	default:
+		return 0
 	}
 }
 

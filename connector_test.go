@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -212,6 +213,7 @@ func TestSendUsesHostStreamAndSplitsUTF8Safely(t *testing.T) {
 	content := strings.Repeat("你", platform.MaxMarkdownBytes/3+10)
 	result, err := (Connector{}).Send(context.Background(), runtime, sdk.OutboundMessage{
 		AccountUUID: account.UUID,
+		MessageUUID: "message-1",
 		ChatType:    sdk.ChatTypeDirect,
 		ChatID:      "user-1",
 		Text:        content,
@@ -238,6 +240,179 @@ func TestSendUsesHostStreamAndSplitsUTF8Safely(t *testing.T) {
 	}
 	if rebuilt.String() != content {
 		t.Fatal("split content was not reconstructed exactly")
+	}
+}
+
+func TestSendResumesAfterPartialChunkFailureWithoutDuplicatingCompletedChunks(t *testing.T) {
+	account := testAccount()
+	store := &testAccountStore{}
+	transport := &flakyTestStreamTransport{failCall: 2}
+	runtime := testRuntime(account, &testGateway{}, store)
+	runtime.Stream = transport
+	content := strings.Repeat("你", platform.MaxMarkdownBytes/3+10)
+	req := sdk.OutboundMessage{
+		AccountUUID: account.UUID,
+		MessageUUID: "message-resume-1",
+		ChatType:    sdk.ChatTypeDirect,
+		ChatID:      "user-1",
+		Text:        content,
+		Format:      "markdown",
+	}
+
+	if _, err := (Connector{}).Send(context.Background(), runtime, req); err == nil || !strings.Contains(err.Error(), "temporary stream failure") {
+		t.Fatalf("first Send() error = %v, want temporary stream failure", err)
+	}
+	if got := transport.requestCount(); got != 2 {
+		t.Fatalf("first Send() requests = %d, want 2", got)
+	}
+
+	result, err := (Connector{}).Send(context.Background(), runtime, req)
+	if err != nil {
+		t.Fatalf("resumed Send() error = %v", err)
+	}
+	if got := transport.requestCount(); got != 3 {
+		t.Fatalf("requests after resume = %d, want 3 (first chunk once, failed chunk retried)", got)
+	}
+	if result == nil || result.MessageID == "" {
+		t.Fatalf("resumed result = %#v", result)
+	}
+	requests := transport.snapshot()
+	first := mustParseFrame(t, requests[0].Frame.Data)
+	failed := mustParseFrame(t, requests[1].Frame.Data)
+	retried := mustParseFrame(t, requests[2].Frame.Data)
+	firstMarkdown, _ := first.Body["markdown"].(map[string]any)
+	failedMarkdown, _ := failed.Body["markdown"].(map[string]any)
+	retriedMarkdown, _ := retried.Body["markdown"].(map[string]any)
+	if stringValue(firstMarkdown["content"]) == stringValue(retriedMarkdown["content"]) {
+		t.Fatal("completed first chunk was sent again during resume")
+	}
+	if stringValue(failedMarkdown["content"]) != stringValue(retriedMarkdown["content"]) {
+		t.Fatal("resume did not retry the failed chunk")
+	}
+
+	if _, err := (Connector{}).Send(context.Background(), runtime, req); err != nil {
+		t.Fatalf("completed Send() replay error = %v", err)
+	}
+	if got := transport.requestCount(); got != 3 {
+		t.Fatalf("completed message was sent again: requests=%d", got)
+	}
+	changed := req
+	changed.Text += " changed"
+	if _, err := (Connector{}).Send(context.Background(), runtime, changed); err == nil || !strings.Contains(err.Error(), "different outbound payload") {
+		t.Fatalf("changed payload Send() error = %v, want message_uuid reuse rejection", err)
+	}
+	state, err := store.LoadChannelAccountState(context.Background(), account.UUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := mapValue(decodeOutboundChunkProgressEntries(state[outboundChunkProgressKey])[req.MessageUUID])
+	if entry["completed"] != true || intValue(entry["next_index"]) != 2 {
+		t.Fatalf("stored outbound progress = %#v, want completed two chunks", entry)
+	}
+}
+
+func TestSendDoesNotPersistProgressForSingleChunk(t *testing.T) {
+	account := testAccount()
+	store := &testAccountStore{}
+	runtime := testRuntime(account, &testGateway{}, store)
+	runtime.Stream = &testStreamTransport{}
+
+	_, err := (Connector{}).Send(context.Background(), runtime, sdk.OutboundMessage{
+		AccountUUID: account.UUID,
+		MessageUUID: "message-single",
+		ChatType:    sdk.ChatTypeDirect,
+		ChatID:      "user-1",
+		Text:        "short message",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.LoadChannelAccountState(context.Background(), account.UUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := state[outboundChunkProgressKey]; exists {
+		t.Fatalf("single-chunk send persisted progress: %#v", state[outboundChunkProgressKey])
+	}
+}
+
+func TestSendProgressSaveUsesAtomicBoundedPatch(t *testing.T) {
+	account := testAccount()
+	oldEntries := map[string]any{}
+	for index := 0; index < maxTrackedOutboundProgress; index++ {
+		key := fmt.Sprintf("old-%03d", index)
+		oldEntries[key] = map[string]any{
+			"fingerprint": "old",
+			"next_index":  1,
+			"message_ids": []any{"old-message"},
+			"completed":   true,
+			"updated_at":  time.Date(2026, 1, 1, 0, 0, index, 0, time.UTC).Format(time.RFC3339Nano),
+		}
+	}
+	store := &testAccountStore{state: map[string]map[string]any{
+		account.UUID: {
+			sdk.RuntimeHealthKeyStreamConnectionState: sdk.RuntimeHealthStateConnected,
+			outboundChunkProgressKey:                  oldEntries,
+		},
+	}}
+	runtime := testRuntime(account, &testGateway{}, store)
+	runtime.Stream = &testStreamTransport{}
+	content := strings.Repeat("你", platform.MaxMarkdownBytes/3+10)
+
+	_, err := (Connector{}).Send(context.Background(), runtime, sdk.OutboundMessage{
+		AccountUUID: account.UUID,
+		MessageUUID: "message-new",
+		ChatType:    sdk.ChatTypeDirect,
+		ChatID:      "user-1",
+		Text:        content,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := store.lastSavedPatch()
+	if _, exists := patch[sdk.RuntimeHealthKeyStreamConnectionState]; exists {
+		t.Fatalf("progress save overwrote concurrent health state: %#v", patch)
+	}
+	if _, ok := patch[outboundChunkProgressKey].([]any); !ok {
+		t.Fatalf("progress patch must atomically replace a list, got %T", patch[outboundChunkProgressKey])
+	}
+	state, err := store.LoadChannelAccountState(context.Background(), account.UUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := decodeOutboundChunkProgressEntries(state[outboundChunkProgressKey])
+	if len(entries) != maxTrackedOutboundProgress {
+		t.Fatalf("tracked progress count = %d, want %d", len(entries), maxTrackedOutboundProgress)
+	}
+	if _, exists := entries["old-000"]; exists {
+		t.Fatal("oldest outbound progress entry was not pruned")
+	}
+	if _, exists := entries["message-new"]; !exists {
+		t.Fatal("new outbound progress entry was not persisted")
+	}
+}
+
+func TestSendRequiresRetryStateForMultipartOutbound(t *testing.T) {
+	account := testAccount()
+	content := strings.Repeat("你", platform.MaxMarkdownBytes/3+10)
+	baseReq := sdk.OutboundMessage{
+		AccountUUID: account.UUID,
+		ChatType:    sdk.ChatTypeDirect,
+		ChatID:      "user-1",
+		Text:        content,
+		Format:      "markdown",
+	}
+
+	runtime := testRuntime(account, &testGateway{}, &testAccountStore{})
+	runtime.Stream = &testStreamTransport{}
+	if _, err := (Connector{}).Send(context.Background(), runtime, baseReq); err == nil || !strings.Contains(err.Error(), "message_uuid") {
+		t.Fatalf("missing message_uuid error = %v", err)
+	}
+
+	baseReq.MessageUUID = "message-multipart"
+	runtime.AccountStore = nil
+	if _, err := (Connector{}).Send(context.Background(), runtime, baseReq); err == nil || !strings.Contains(err.Error(), "AccountStore") {
+		t.Fatalf("missing AccountStore error = %v", err)
 	}
 }
 
@@ -372,8 +547,9 @@ func (*testGateway) BridgeParticipantID(platform string) string {
 }
 
 type testAccountStore struct {
-	mu    sync.Mutex
-	state map[string]map[string]any
+	mu      sync.Mutex
+	state   map[string]map[string]any
+	patches []map[string]any
 }
 
 func (s *testAccountStore) LoadChannelAccountState(_ context.Context, accountUUID string) (map[string]any, error) {
@@ -385,11 +561,21 @@ func (s *testAccountStore) LoadChannelAccountState(_ context.Context, accountUUI
 func (s *testAccountStore) SaveChannelAccountState(_ context.Context, accountUUID string, state map[string]any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.patches = append(s.patches, cloneMap(state))
 	current := s.ensure(accountUUID)
 	for key, value := range state {
 		current[key] = value
 	}
 	return nil
+}
+
+func (s *testAccountStore) lastSavedPatch() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.patches) == 0 {
+		return nil
+	}
+	return cloneMap(s.patches[len(s.patches)-1])
 }
 
 func (s *testAccountStore) ensure(accountUUID string) map[string]any {
@@ -405,6 +591,41 @@ func (s *testAccountStore) ensure(accountUUID string) map[string]any {
 type testStreamTransport struct {
 	mu       sync.Mutex
 	requests []sdk.StreamRequest
+}
+
+type flakyTestStreamTransport struct {
+	mu       sync.Mutex
+	requests []sdk.StreamRequest
+	failCall int
+}
+
+func (s *flakyTestStreamTransport) Request(_ context.Context, req sdk.StreamRequest) (*sdk.StreamResponse, error) {
+	s.mu.Lock()
+	s.requests = append(s.requests, req)
+	call := len(s.requests)
+	s.mu.Unlock()
+	if call == s.failCall {
+		return nil, errors.New("temporary stream failure")
+	}
+	return &sdk.StreamResponse{
+		CorrelationID: req.CorrelationID,
+		Frame: sdk.StreamFrame{MessageType: sdk.StreamMessageTypeText, Data: mustProtocolFrame(platform.Frame{
+			Headers: platform.FrameHeaders{RequestID: req.CorrelationID},
+			Body:    map[string]any{"msgid": fmt.Sprintf("sent-%d", call)},
+		})},
+	}, nil
+}
+
+func (s *flakyTestStreamTransport) requestCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.requests)
+}
+
+func (s *flakyTestStreamTransport) snapshot() []sdk.StreamRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]sdk.StreamRequest(nil), s.requests...)
 }
 
 func (s *testStreamTransport) Request(_ context.Context, req sdk.StreamRequest) (*sdk.StreamResponse, error) {
