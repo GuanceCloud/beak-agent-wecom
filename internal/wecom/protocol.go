@@ -11,23 +11,26 @@ import (
 const (
 	DefaultWebSocketURL = "wss://openws.work.weixin.qq.com"
 
-	CommandSubscribe   = "aibot_subscribe"
-	CommandPing        = "ping"
-	CommandRespond     = "aibot_respond_msg"
-	CommandSendMessage = "aibot_send_msg"
-	CommandMessage     = "aibot_msg_callback"
-	CommandEvent       = "aibot_event_callback"
-	EventDisconnected  = "disconnected_event"
-	MessageTypeText    = "text"
-	MessageTypeImage   = "image"
-	MessageTypeMixed   = "mixed"
-	MessageTypeVoice   = "voice"
-	MessageTypeFile    = "file"
-	MessageTypeVideo   = "video"
-	MessageTypeEvent   = "event"
-	ChatTypeSingle     = "single"
-	ChatTypeGroup      = "group"
-	MaxMarkdownBytes   = 20480
+	CommandSubscribe    = "aibot_subscribe"
+	CommandPing         = "ping"
+	CommandRespond      = "aibot_respond_msg"
+	CommandSendMessage  = "aibot_send_msg"
+	CommandUploadInit   = "aibot_upload_media_init"
+	CommandUploadChunk  = "aibot_upload_media_chunk"
+	CommandUploadFinish = "aibot_upload_media_finish"
+	CommandMessage      = "aibot_msg_callback"
+	CommandEvent        = "aibot_event_callback"
+	EventDisconnected   = "disconnected_event"
+	MessageTypeText     = "text"
+	MessageTypeImage    = "image"
+	MessageTypeMixed    = "mixed"
+	MessageTypeVoice    = "voice"
+	MessageTypeFile     = "file"
+	MessageTypeVideo    = "video"
+	MessageTypeEvent    = "event"
+	ChatTypeSingle      = "single"
+	ChatTypeGroup       = "group"
+	MaxMarkdownBytes    = 20480
 )
 
 type Frame struct {
@@ -161,6 +164,58 @@ func SendMarkdownFrame(requestID, chatID, content string) Frame {
 			"msgtype":  "markdown",
 			"markdown": map[string]any{"content": content},
 		},
+	}
+}
+
+func SendMediaFrame(requestID, chatID, kind, mediaID string) Frame {
+	kind = strings.TrimSpace(kind)
+	msgType := kind
+	if kind == "sticker" {
+		msgType = MessageTypeImage
+	}
+	content := map[string]any{"media_id": strings.TrimSpace(mediaID)}
+	return Frame{
+		Command: CommandSendMessage,
+		Headers: FrameHeaders{RequestID: requestID},
+		Body: map[string]any{
+			"chatid":  strings.TrimSpace(chatID),
+			"msgtype": msgType,
+			msgType:   content,
+		},
+	}
+}
+
+func UploadMediaInitFrame(requestID, kind, fileName string, size int64, chunks int, md5sum string) Frame {
+	return Frame{
+		Command: CommandUploadInit,
+		Headers: FrameHeaders{RequestID: requestID},
+		Body: map[string]any{
+			"type":         strings.TrimSpace(kind),
+			"filename":     strings.TrimSpace(fileName),
+			"total_size":   size,
+			"total_chunks": chunks,
+			"md5":          strings.TrimSpace(md5sum),
+		},
+	}
+}
+
+func UploadMediaChunkFrame(requestID, uploadID string, index int, encoded string) Frame {
+	return Frame{
+		Command: CommandUploadChunk,
+		Headers: FrameHeaders{RequestID: requestID},
+		Body: map[string]any{
+			"upload_id":   strings.TrimSpace(uploadID),
+			"chunk_index": index,
+			"base64_data": encoded,
+		},
+	}
+}
+
+func UploadMediaFinishFrame(requestID, uploadID string) Frame {
+	return Frame{
+		Command: CommandUploadFinish,
+		Headers: FrameHeaders{RequestID: requestID},
+		Body:    map[string]any{"upload_id": strings.TrimSpace(uploadID)},
 	}
 }
 

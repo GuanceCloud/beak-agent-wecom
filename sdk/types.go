@@ -157,6 +157,7 @@ type Capabilities struct {
 	LoginModes          []string `json:"login_modes"`
 	Text                bool     `json:"text"`
 	Media               bool     `json:"media"`
+	MediaKinds          []string `json:"media_kinds,omitempty"`
 	GroupChat           bool     `json:"group_chat"`
 	DirectChat          bool     `json:"direct_chat"`
 	Stream              bool     `json:"stream"`
@@ -165,6 +166,39 @@ type Capabilities struct {
 	BlockStreaming      bool     `json:"block_streaming"`
 	AckModes            []string `json:"ack_modes,omitempty"`
 	RuntimeOwnership    string   `json:"runtime_ownership,omitempty"`
+}
+
+const (
+	MediaKindImage   = "image"
+	MediaKindFile    = "file"
+	MediaKindAudio   = "audio"
+	MediaKindVideo   = "video"
+	MediaKindSticker = "sticker"
+
+	MediaSourceURL              = "url"
+	MediaSourcePath             = "path"
+	MediaSourcePlatformResource = "platform_resource"
+
+	AttachmentStatusSent        = "sent"
+	AttachmentStatusSkipped     = "skipped"
+	AttachmentStatusUnsupported = "unsupported"
+	AttachmentStatusFailed      = "failed"
+	AttachmentStatusDegraded    = "degraded"
+)
+
+type MediaAttachment struct {
+	ID                 string         `json:"id,omitempty"`
+	Kind               string         `json:"kind"`
+	Source             string         `json:"source,omitempty"`
+	URL                string         `json:"url,omitempty"`
+	Path               string         `json:"path,omitempty"`
+	ContentType        string         `json:"content_type,omitempty"`
+	FileName           string         `json:"file_name,omitempty"`
+	SizeBytes          int64          `json:"size_bytes,omitempty"`
+	DurationMillis     int64          `json:"duration_millis,omitempty"`
+	AltText            string         `json:"alt_text,omitempty"`
+	PlatformResourceID string         `json:"platform_resource_id,omitempty"`
+	Raw                map[string]any `json:"raw,omitempty"`
 }
 
 type CredentialSchema struct {
@@ -326,6 +360,7 @@ type InboundMessage struct {
 	SenderDisplayName string             `json:"sender_display_name,omitempty"`
 	MessageID         string             `json:"message_id,omitempty"`
 	Text              string             `json:"text"`
+	Attachments       []MediaAttachment  `json:"attachments,omitempty"`
 	ReferencedMessage *ReferencedMessage `json:"referenced_message,omitempty"`
 	DedupeKey         string             `json:"dedupe_key,omitempty"`
 	Mentions          []MentionIdentity  `json:"mentions,omitempty"`
@@ -379,18 +414,30 @@ type OutboundMessage struct {
 	Format string `json:"format,omitempty"`
 	// Title is a common markdown title hint. Hosts should pass it uniformly and
 	// let the SDK decide whether the platform can use it.
-	Title      string            `json:"title,omitempty"`
-	Mentions   []MentionIdentity `json:"mentions,omitempty"`
-	MentionAll bool              `json:"mention_all,omitempty"`
+	Title       string            `json:"title,omitempty"`
+	Attachments []MediaAttachment `json:"attachments,omitempty"`
+	Mentions    []MentionIdentity `json:"mentions,omitempty"`
+	MentionAll  bool              `json:"mention_all,omitempty"`
 	// Raw is a platform-native escape hatch, not required for common text or markdown.
 	Raw map[string]any `json:"raw,omitempty"`
 }
 
+type AttachmentSendResult struct {
+	AttachmentID       string         `json:"attachment_id,omitempty"`
+	Kind               string         `json:"kind,omitempty"`
+	Status             string         `json:"status"`
+	MessageID          string         `json:"message_id,omitempty"`
+	PlatformResourceID string         `json:"platform_resource_id,omitempty"`
+	Error              string         `json:"error,omitempty"`
+	Raw                map[string]any `json:"raw,omitempty"`
+}
+
 type SendResult struct {
-	Platform    string         `json:"platform"`
-	AccountUUID string         `json:"account_uuid"`
-	MessageID   string         `json:"message_id,omitempty"`
-	Raw         map[string]any `json:"raw,omitempty"`
+	Platform          string                 `json:"platform"`
+	AccountUUID       string                 `json:"account_uuid"`
+	MessageID         string                 `json:"message_id,omitempty"`
+	AttachmentResults []AttachmentSendResult `json:"attachment_results,omitempty"`
+	Raw               map[string]any         `json:"raw,omitempty"`
 }
 
 type OutboundAck struct {
@@ -456,6 +503,7 @@ type CreateMessageRequest struct {
 	SenderID      string
 	Content       string
 	DedupeKey     string
+	Attachments   []MediaAttachment `json:"attachments,omitempty"`
 	Metadata      map[string]any
 }
 

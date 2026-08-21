@@ -2,7 +2,15 @@ package beakwecom
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -12,9 +20,22 @@ import (
 )
 
 const (
-	wecomPingInterval = 30 * time.Second
-	wecomPongTimeout  = 10 * time.Second
+	wecomPingInterval        = 30 * time.Second
+	wecomPongTimeout         = 10 * time.Second
+	wecomMaxMediaBytes int64 = 32 << 20
 )
+
+func blockedMediaHost(host string) bool {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
 
 type streamState struct {
 	AuthRequestID string
@@ -179,6 +200,13 @@ func (c Connector) processMessageFrame(ctx context.Context, runtime sdk.Runtime,
 		return &EventResult{Type: "message", Ignored: true, Reason: "incomplete_message"}, nil
 	}
 	text := platform.MessageText(message)
+	attachments, cleanupAttachments, attachmentErrors := downloadWeComAttachments(ctx, runtime.HTTPClient, message)
+	if cleanupAttachments != nil {
+		defer cleanupAttachments()
+	}
+	if strings.TrimSpace(text) == "" && (len(attachments) > 0 || len(attachmentErrors) > 0) {
+		text = wecomAttachmentPlaceholder(attachments, attachmentErrors)
+	}
 	if text == "" && !supportedMessageType(message.MessageType) {
 		return &EventResult{Type: "message", Ignored: true, Reason: "unsupported_message_type"}, nil
 	}
@@ -195,6 +223,10 @@ func (c Connector) processMessageFrame(ctx context.Context, runtime sdk.Runtime,
 	}
 
 	inbound := buildInboundMessage(runtime, accountUUID, message, chatType, chatID, text, dedupeKey)
+	inbound.Attachments = attachments
+	if len(attachmentErrors) > 0 {
+		inbound.Raw["attachment_errors"] = attachmentErrors
+	}
 	sessionUUID, err := runtime.Gateway.EnsureChatSession(ctx, sdk.EnsureChatSessionRequest{
 		WorkspaceUUID:       runtime.WorkspaceUUID,
 		Platform:            Platform,
@@ -220,6 +252,7 @@ func (c Connector) processMessageFrame(ctx context.Context, runtime sdk.Runtime,
 		SenderID:      sdk.IMPersonParticipantID(Platform, chatType, chatID, senderID),
 		Content:       text,
 		DedupeKey:     dedupeKey,
+		Attachments:   inbound.Attachments,
 		Metadata: map[string]any{
 			"source":             Platform,
 			"platform":           Platform,
@@ -247,6 +280,175 @@ func (c Connector) processMessageFrame(ctx context.Context, runtime sdk.Runtime,
 		return nil, err
 	}
 	return &EventResult{Type: "message", SessionUUID: sessionUUID, MessageUUID: messageUUID, Inbound: &inbound}, nil
+}
+
+func downloadWeComAttachments(ctx context.Context, client *http.Client, message platform.Message) ([]sdk.MediaAttachment, func(), []string) {
+	type item struct {
+		kind  string
+		media *platform.MediaContent
+	}
+	items := make([]item, 0, 2)
+	switch message.MessageType {
+	case platform.MessageTypeImage:
+		items = append(items, item{sdk.MediaKindImage, message.Image})
+	case platform.MessageTypeFile:
+		items = append(items, item{sdk.MediaKindFile, message.File})
+	case platform.MessageTypeVoice:
+		items = append(items, item{sdk.MediaKindAudio, mediaContentFromText(message.Voice)})
+	case platform.MessageTypeVideo:
+		items = append(items, item{sdk.MediaKindVideo, message.Video})
+	case platform.MessageTypeMixed:
+		for _, mixed := range message.Mixed.Items {
+			if mixed.Image != nil {
+				items = append(items, item{sdk.MediaKindImage, mixed.Image})
+			}
+		}
+	}
+	attachments := make([]sdk.MediaAttachment, 0, len(items))
+	cleanups := make([]func(), 0, len(items))
+	var errs []string
+	cleanup := func() {
+		for index := len(cleanups) - 1; index >= 0; index-- {
+			if cleanups[index] != nil {
+				cleanups[index]()
+			}
+		}
+	}
+	for _, current := range items {
+		if current.media == nil || strings.TrimSpace(current.media.URL) == "" {
+			errs = append(errs, "wecom media URL is missing")
+			continue
+		}
+		path, remove, err := downloadWeComURL(ctx, client, current.media.URL, current.media.AESKey)
+		if err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		cleanups = append(cleanups, remove)
+		attachments = append(attachments, sdk.MediaAttachment{ID: current.media.URL, Kind: current.kind, Source: sdk.MediaSourcePath, Path: path, PlatformResourceID: current.media.URL})
+	}
+	return attachments, cleanup, errs
+}
+
+func mediaContentFromText(value *platform.TextContent) *platform.MediaContent {
+	if value == nil || strings.TrimSpace(value.Content) == "" {
+		return nil
+	}
+	return &platform.MediaContent{URL: value.Content}
+}
+
+func downloadWeComURL(ctx context.Context, client *http.Client, rawURL, aesKey string) (string, func(), error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Host == "" || parsed.Scheme != "https" {
+		return "", nil, fmt.Errorf("wecom media URL must be HTTPS")
+	}
+	if blockedMediaHost(parsed.Hostname()) {
+		return "", nil, fmt.Errorf("wecom media URL host is not allowed")
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return "", nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", nil, fmt.Errorf("wecom media download failed: status=%d", resp.StatusCode)
+	}
+	tmp, err := os.CreateTemp("", "beak-wecom-media-*")
+	if err != nil {
+		return "", nil, err
+	}
+	path := tmp.Name()
+	cleanup := func() { _ = os.Remove(path) }
+	data, err := io.ReadAll(io.LimitReader(resp.Body, wecomMaxMediaBytes+1))
+	if err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if strings.TrimSpace(aesKey) != "" {
+		data, err = decryptWeComMedia(data, aesKey)
+		if err != nil {
+			_ = tmp.Close()
+			cleanup()
+			return "", nil, err
+		}
+	}
+	if int64(len(data)) > wecomMaxMediaBytes {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("wecom media exceeds %d bytes", wecomMaxMediaBytes)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
+}
+
+func decryptWeComMedia(ciphertext []byte, rawKey string) ([]byte, error) {
+	keyText := strings.TrimSpace(rawKey)
+	key, err := base64.StdEncoding.DecodeString(keyText)
+	if err != nil {
+		key, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(keyText, "="))
+	}
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("wecom media AES key must decode to 32 bytes")
+	}
+	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("wecom media ciphertext has invalid size")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	plaintext := make([]byte, len(ciphertext))
+	iv := key[:aes.BlockSize]
+	decrypter := cipher.NewCBCDecrypter(block, iv)
+	decrypter.CryptBlocks(plaintext, ciphertext)
+	padding := int(plaintext[len(plaintext)-1])
+	if padding == 0 || padding > len(plaintext) || padding > 32 {
+		return nil, fmt.Errorf("wecom media has invalid PKCS padding")
+	}
+	for _, value := range plaintext[len(plaintext)-padding:] {
+		if int(value) != padding {
+			return nil, fmt.Errorf("wecom media has invalid PKCS padding")
+		}
+	}
+	return plaintext[:len(plaintext)-padding], nil
+}
+
+func wecomAttachmentPlaceholder(attachments []sdk.MediaAttachment, errors []string) string {
+	labels := make([]string, 0, len(attachments)+len(errors))
+	for _, attachment := range attachments {
+		label := "附件"
+		switch attachment.Kind {
+		case sdk.MediaKindImage:
+			label = "图片"
+		case sdk.MediaKindAudio:
+			label = "音频"
+		case sdk.MediaKindVideo:
+			label = "视频"
+		case sdk.MediaKindFile:
+			label = "文件"
+		}
+		labels = append(labels, "["+label+"]")
+	}
+	for range errors {
+		labels = append(labels, "[附件下载失败]")
+	}
+	return strings.Join(labels, " ")
 }
 
 func buildInboundMessage(runtime sdk.Runtime, accountUUID string, message platform.Message, chatType, chatID, text, dedupeKey string) sdk.InboundMessage {

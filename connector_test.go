@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -240,6 +242,41 @@ func TestSendUsesHostStreamAndSplitsUTF8Safely(t *testing.T) {
 	}
 	if rebuilt.String() != content {
 		t.Fatal("split content was not reconstructed exactly")
+	}
+}
+
+func TestSendUploadsLocalAttachmentBeforeSendingMediaMessage(t *testing.T) {
+	account := testAccount()
+	transport := &mediaTestStreamTransport{}
+	runtime := testRuntime(account, &testGateway{}, &testAccountStore{})
+	runtime.Stream = transport
+	path := filepath.Join(t.TempDir(), "photo.png")
+	if err := os.WriteFile(path, []byte("image-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (Connector{}).Send(context.Background(), runtime, sdk.OutboundMessage{
+		AccountUUID: account.UUID,
+		MessageUUID: "message-media-1",
+		ChatType:    sdk.ChatTypeDirect,
+		ChatID:      "user-1",
+		Attachments: []sdk.MediaAttachment{{ID: "asset-1", Kind: sdk.MediaKindImage, Source: sdk.MediaSourcePath, Path: path, FileName: "photo.png"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || len(result.AttachmentResults) != 1 || result.AttachmentResults[0].Status != sdk.AttachmentStatusSent {
+		t.Fatalf("result=%+v", result)
+	}
+	if len(transport.requests) != 4 {
+		t.Fatalf("requests=%d, want init+chunk+finish+send", len(transport.requests))
+	}
+	frame := mustParseFrame(t, transport.requests[3].Frame.Data)
+	if frame.Command != platform.CommandSendMessage {
+		t.Fatalf("send frame=%+v", frame)
+	}
+	image, _ := frame.Body[platform.MessageTypeImage].(map[string]any)
+	if image["media_id"] != "media-1" {
+		t.Fatalf("media body=%+v", image)
 	}
 }
 
@@ -591,6 +628,34 @@ func (s *testAccountStore) ensure(accountUUID string) map[string]any {
 type testStreamTransport struct {
 	mu       sync.Mutex
 	requests []sdk.StreamRequest
+}
+
+type mediaTestStreamTransport struct {
+	requests []sdk.StreamRequest
+}
+
+func (s *mediaTestStreamTransport) Request(_ context.Context, req sdk.StreamRequest) (*sdk.StreamResponse, error) {
+	s.requests = append(s.requests, req)
+	frame, err := platform.ParseFrame(req.Frame.Data)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{}
+	switch frame.Command {
+	case platform.CommandUploadInit:
+		body["upload_id"] = "upload-1"
+	case platform.CommandUploadFinish:
+		body["media_id"] = "media-1"
+	case platform.CommandSendMessage:
+		body["msgid"] = "message-1"
+	}
+	return &sdk.StreamResponse{
+		CorrelationID: req.CorrelationID,
+		Frame: sdk.StreamFrame{MessageType: sdk.StreamMessageTypeText, Data: mustProtocolFrame(platform.Frame{
+			Headers: platform.FrameHeaders{RequestID: req.CorrelationID},
+			Body:    body,
+		})},
+	}, nil
 }
 
 type flakyTestStreamTransport struct {

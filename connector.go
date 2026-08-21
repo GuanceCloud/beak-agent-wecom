@@ -2,12 +2,17 @@ package beakwecom
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -25,6 +30,8 @@ const (
 	streamRequestTimeout        = 10 * time.Second
 	maxTrackedInbound           = 4096
 	maxTrackedOutboundProgress  = 256
+	maxWecomMediaBytes          = 50 << 20
+	wecomMediaChunkBytes        = 512 << 10
 	outboundChunkProgressKey    = "outbound_chunk_progress"
 )
 
@@ -67,6 +74,7 @@ func (c Connector) Metadata() sdk.ConnectorMetadata {
 			LoginModes:       []string{sdk.LoginModeCredential},
 			Text:             caps.Text,
 			Media:            caps.Media,
+			MediaKinds:       append([]string(nil), caps.MediaKinds...),
 			GroupChat:        caps.GroupChat,
 			DirectChat:       caps.DirectChat,
 			Stream:           true,
@@ -272,7 +280,7 @@ func (Connector) Start(ctx context.Context, runtime sdk.Runtime) error {
 	return nil
 }
 
-func (Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.OutboundMessage) (*sdk.SendResult, error) {
+func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.OutboundMessage) (*sdk.SendResult, error) {
 	account, err := selectRuntimeAccount(runtime, req.AccountUUID)
 	if err != nil {
 		return nil, err
@@ -281,11 +289,108 @@ func (Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbound
 	if strings.TrimSpace(req.ChatID) == "" {
 		return nil, fmt.Errorf("wecom outbound chat_id is required")
 	}
-	if strings.TrimSpace(req.Text) == "" {
-		return nil, fmt.Errorf("wecom outbound text is required")
+	if strings.TrimSpace(req.Text) == "" && len(req.Attachments) == 0 {
+		return nil, fmt.Errorf("wecom outbound text or attachments are required")
 	}
 	if runtime.Stream == nil {
 		return nil, fmt.Errorf("wecom host stream transport is unavailable")
+	}
+	if len(req.Attachments) > 0 {
+		result := &sdk.SendResult{Platform: Platform, AccountUUID: accountUUID, Raw: map[string]any{"delivery_method": "host_stream"}}
+		if strings.TrimSpace(req.Text) != "" {
+			textReq := req
+			textReq.Attachments = nil
+			textResult, textErr := c.Send(ctx, runtime, textReq)
+			if textErr != nil {
+				return nil, textErr
+			}
+			result.MessageID = textResult.MessageID
+			if textResult.Raw != nil {
+				result.Raw["text_result"] = textResult.Raw
+			}
+		}
+		var attachmentErrors []string
+		for _, attachment := range req.Attachments {
+			item := sdk.AttachmentSendResult{AttachmentID: attachment.ID, Kind: attachment.Kind, Status: sdk.AttachmentStatusFailed}
+			if validateErr := sdk.ValidateMediaAttachment(attachment); validateErr != nil {
+				item.Error = validateErr.Error()
+				attachmentErrors = append(attachmentErrors, item.Error)
+				result.AttachmentResults = append(result.AttachmentResults, item)
+				continue
+			}
+			mediaPath := strings.TrimSpace(attachment.Path)
+			if mediaPath == "" {
+				item.Error = "wecom outbound attachments require a local path"
+				attachmentErrors = append(attachmentErrors, item.Error)
+				result.AttachmentResults = append(result.AttachmentResults, item)
+				continue
+			}
+			data, readErr := readWecomOutboundMedia(mediaPath)
+			if readErr != nil {
+				item.Error = readErr.Error()
+				attachmentErrors = append(attachmentErrors, item.Error)
+				result.AttachmentResults = append(result.AttachmentResults, item)
+				continue
+			}
+			fileName := strings.TrimSpace(attachment.FileName)
+			if fileName == "" {
+				fileName = filepath.Base(mediaPath)
+			}
+			mediaID, uploadErr := uploadWecomMedia(ctx, runtime.Stream, attachment.Kind, fileName, data)
+			if uploadErr != nil {
+				item.Error = uploadErr.Error()
+				attachmentErrors = append(attachmentErrors, item.Error)
+				result.AttachmentResults = append(result.AttachmentResults, item)
+				continue
+			}
+			requestID, requestErr := platform.NewRequestID(platform.CommandSendMessage)
+			if requestErr != nil {
+				item.Error = requestErr.Error()
+				attachmentErrors = append(attachmentErrors, item.Error)
+				result.AttachmentResults = append(result.AttachmentResults, item)
+				continue
+			}
+			payload, marshalErr := platform.MarshalFrame(platform.SendMediaFrame(requestID, req.ChatID, attachment.Kind, mediaID))
+			if marshalErr != nil {
+				item.Error = marshalErr.Error()
+				attachmentErrors = append(attachmentErrors, item.Error)
+				result.AttachmentResults = append(result.AttachmentResults, item)
+				continue
+			}
+			response, sendErr := runtime.Stream.Request(ctx, sdk.StreamRequest{Frame: sdk.StreamFrame{MessageType: sdk.StreamMessageTypeText, Data: payload}, CorrelationID: requestID, Timeout: streamRequestTimeout})
+			if sendErr != nil || response == nil {
+				if sendErr == nil {
+					sendErr = fmt.Errorf("empty stream response")
+				}
+				item.Error = sendErr.Error()
+				attachmentErrors = append(attachmentErrors, item.Error)
+				result.AttachmentResults = append(result.AttachmentResults, item)
+				continue
+			}
+			ack, parseErr := platform.ParseFrame(response.Frame.Data)
+			if parseErr != nil || ack.ErrCode != 0 {
+				if parseErr != nil {
+					item.Error = parseErr.Error()
+				} else {
+					item.Error = fmt.Sprintf("wecom media send failed: code=%d message=%s", ack.ErrCode, ack.ErrMsg)
+				}
+				attachmentErrors = append(attachmentErrors, item.Error)
+				result.AttachmentResults = append(result.AttachmentResults, item)
+				continue
+			}
+			item.Status = sdk.AttachmentStatusSent
+			item.MessageID = firstString(stringValue(ack.Body["msgid"]), requestID)
+			item.PlatformResourceID = mediaID
+			result.MessageID = item.MessageID
+			result.AttachmentResults = append(result.AttachmentResults, item)
+		}
+		if len(attachmentErrors) > 0 {
+			result.Raw["attachment_errors"] = attachmentErrors
+		}
+		if result.MessageID == "" {
+			return result, fmt.Errorf("%s outbound attachments failed", Platform)
+		}
+		return result, nil
 	}
 
 	chunks := splitUTF8(req.Text, platform.MaxMarkdownBytes)
@@ -357,6 +462,127 @@ func (Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbound
 		}
 	}
 	return wecomSendResult(accountUUID, messageIDs, len(chunks)), nil
+}
+
+func readWecomOutboundMedia(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("wecom media path is not a regular file")
+	}
+	if info.Size() > maxWecomMediaBytes {
+		return nil, fmt.Errorf("wecom media exceeds %d bytes", maxWecomMediaBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxWecomMediaBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxWecomMediaBytes {
+		return nil, fmt.Errorf("wecom media exceeds %d bytes", maxWecomMediaBytes)
+	}
+	return data, nil
+}
+
+func uploadWecomMedia(ctx context.Context, stream sdk.StreamTransport, kind, fileName string, data []byte) (string, error) {
+	if stream == nil {
+		return "", fmt.Errorf("wecom host stream transport is unavailable")
+	}
+	kind = strings.TrimSpace(kind)
+	if kind == "sticker" {
+		kind = sdk.MediaKindImage
+	}
+	if kind != sdk.MediaKindImage && kind != sdk.MediaKindFile && kind != sdk.MediaKindAudio && kind != sdk.MediaKindVideo {
+		return "", fmt.Errorf("wecom outbound media kind %q is unsupported", kind)
+	}
+	if fileName == "" {
+		fileName = "attachment"
+	}
+	chunkCount := (len(data) + wecomMediaChunkBytes - 1) / wecomMediaChunkBytes
+	if chunkCount == 0 {
+		chunkCount = 1
+	}
+	initID, err := platform.NewRequestID(platform.CommandUploadInit)
+	if err != nil {
+		return "", err
+	}
+	initFrame, err := platform.MarshalFrame(platform.UploadMediaInitFrame(initID, kind, fileName, int64(len(data)), chunkCount, fmt.Sprintf("%x", md5.Sum(data))))
+	if err != nil {
+		return "", err
+	}
+	initAck, err := requestWecomUploadFrame(ctx, stream, initID, initFrame)
+	if err != nil {
+		return "", fmt.Errorf("wecom media upload init: %w", err)
+	}
+	uploadID := stringValue(initAck.Body["upload_id"])
+	if uploadID == "" {
+		return "", fmt.Errorf("wecom media upload init returned no upload_id")
+	}
+	for index, start := 0, 0; start < len(data); index, start = index+1, start+wecomMediaChunkBytes {
+		end := start + wecomMediaChunkBytes
+		if end > len(data) {
+			end = len(data)
+		}
+		chunkID, err := platform.NewRequestID(platform.CommandUploadChunk)
+		if err != nil {
+			return "", err
+		}
+		chunkFrame, err := platform.MarshalFrame(platform.UploadMediaChunkFrame(chunkID, uploadID, index+1, base64.StdEncoding.EncodeToString(data[start:end])))
+		if err != nil {
+			return "", err
+		}
+		if _, err := requestWecomUploadFrame(ctx, stream, chunkID, chunkFrame); err != nil {
+			return "", fmt.Errorf("wecom media upload chunk %d/%d: %w", index+1, chunkCount, err)
+		}
+	}
+	finishID, err := platform.NewRequestID(platform.CommandUploadFinish)
+	if err != nil {
+		return "", err
+	}
+	finishFrame, err := platform.MarshalFrame(platform.UploadMediaFinishFrame(finishID, uploadID))
+	if err != nil {
+		return "", err
+	}
+	finishAck, err := requestWecomUploadFrame(ctx, stream, finishID, finishFrame)
+	if err != nil {
+		return "", fmt.Errorf("wecom media upload finish: %w", err)
+	}
+	mediaID := stringValue(finishAck.Body["media_id"])
+	if mediaID == "" {
+		return "", fmt.Errorf("wecom media upload finish returned no media_id")
+	}
+	return mediaID, nil
+}
+
+func requestWecomUploadFrame(ctx context.Context, stream sdk.StreamTransport, requestID string, payload []byte) (platform.Frame, error) {
+	response, err := stream.Request(ctx, sdk.StreamRequest{
+		Frame:         sdk.StreamFrame{MessageType: sdk.StreamMessageTypeText, Data: payload},
+		CorrelationID: requestID,
+		Timeout:       streamRequestTimeout,
+	})
+	if err != nil {
+		return platform.Frame{}, err
+	}
+	if response == nil {
+		return platform.Frame{}, fmt.Errorf("empty stream response")
+	}
+	ack, err := platform.ParseFrame(response.Frame.Data)
+	if err != nil {
+		return platform.Frame{}, err
+	}
+	if ack.Headers.RequestID != requestID {
+		return platform.Frame{}, fmt.Errorf("response req_id mismatch: got %q want %q", ack.Headers.RequestID, requestID)
+	}
+	if ack.ErrCode != 0 {
+		return platform.Frame{}, fmt.Errorf("code=%d message=%s", ack.ErrCode, strings.TrimSpace(ack.ErrMsg))
+	}
+	return ack, nil
 }
 
 func wecomSendResult(accountUUID string, messageIDs []string, chunkCount int) *sdk.SendResult {

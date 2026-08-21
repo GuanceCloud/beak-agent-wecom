@@ -16,13 +16,15 @@ Platform key: `wecom`.
 - Host-owned WeCom AI Bot WebSocket connection.
 - Direct and group inbound messages.
 - Readable placeholders for inbound image, voice, file, video, and mixed messages.
+- Inbound media is downloaded (and decrypted when the platform provides an AES key) into a temporary local path before the host imports it.
 - Quoted-message normalization through `ReferencedMessage`.
 - Text or markdown delivery back to the original conversation.
 - UTF-8-safe markdown splitting at the 20 KB platform limit.
 - Inbound deduplication, chat isolation, and standard runtime health.
 - Real WebSocket credential authentication.
+- Outbound image, file, audio, and video attachments use the WeCom same-socket three-step media upload flow and native media messages.
 
-The current version does not download or upload media, build template cards, update one message incrementally, or provide reactions/typing/read acknowledgements. External contacts, customer groups, and WeCom customer-service conversations are outside this connector's scope.
+Template cards, incremental message updates, reactions/typing/read acknowledgements, external contacts, customer groups, and WeCom customer-service conversations remain outside this connector's scope.
 
 ## Required credentials
 
