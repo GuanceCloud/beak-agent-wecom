@@ -121,6 +121,15 @@ type StreamFrameRequest struct {
 type StreamFrame struct {
 	MessageType int
 	Data        []byte
+	ACK         *StreamFrameACK
+}
+
+// StreamFrameACK asks the host to deliver the frame without blocking its
+// reader and report the platform response or transport error.
+type StreamFrameACK struct {
+	CorrelationID string
+	Timeout       time.Duration
+	Complete      func(*StreamResponse, error)
 }
 
 type StreamFrameResult struct {
@@ -154,18 +163,19 @@ type ConnectorMetadata struct {
 }
 
 type Capabilities struct {
-	LoginModes          []string `json:"login_modes"`
-	Text                bool     `json:"text"`
-	Media               bool     `json:"media"`
-	MediaKinds          []string `json:"media_kinds,omitempty"`
-	GroupChat           bool     `json:"group_chat"`
-	DirectChat          bool     `json:"direct_chat"`
-	Stream              bool     `json:"stream"`
-	Webhook             bool     `json:"webhook"`
-	WebhookRegistration string   `json:"webhook_registration,omitempty"`
-	BlockStreaming      bool     `json:"block_streaming"`
-	AckModes            []string `json:"ack_modes,omitempty"`
-	RuntimeOwnership    string   `json:"runtime_ownership,omitempty"`
+	Interactions        InteractionCapabilities `json:"interactions"`
+	LoginModes          []string                `json:"login_modes"`
+	Text                bool                    `json:"text"`
+	Media               bool                    `json:"media"`
+	MediaKinds          []string                `json:"media_kinds,omitempty"`
+	GroupChat           bool                    `json:"group_chat"`
+	DirectChat          bool                    `json:"direct_chat"`
+	Stream              bool                    `json:"stream"`
+	Webhook             bool                    `json:"webhook"`
+	WebhookRegistration string                  `json:"webhook_registration,omitempty"`
+	BlockStreaming      bool                    `json:"block_streaming"`
+	AckModes            []string                `json:"ack_modes,omitempty"`
+	RuntimeOwnership    string                  `json:"runtime_ownership,omitempty"`
 }
 
 const (
@@ -399,16 +409,17 @@ type ChatIdentity struct {
 }
 
 type OutboundMessage struct {
-	WorkspaceUUID string `json:"workspace_uuid"`
-	Platform      string `json:"platform"`
-	AccountUUID   string `json:"account_uuid"`
-	ChannelUUID   string `json:"channel_uuid"`
-	SessionUUID   string `json:"session_uuid"`
-	MessageUUID   string `json:"message_uuid"`
-	ChatType      string `json:"chat_type"`
-	ChatID        string `json:"chat_id"`
-	ThreadID      string `json:"thread_id,omitempty"`
-	Text          string `json:"text"`
+	Interaction   *InteractionCard `json:"interaction,omitempty"`
+	WorkspaceUUID string           `json:"workspace_uuid"`
+	Platform      string           `json:"platform"`
+	AccountUUID   string           `json:"account_uuid"`
+	ChannelUUID   string           `json:"channel_uuid"`
+	SessionUUID   string           `json:"session_uuid"`
+	MessageUUID   string           `json:"message_uuid"`
+	ChatType      string           `json:"chat_type"`
+	ChatID        string           `json:"chat_id"`
+	ThreadID      string           `json:"thread_id,omitempty"`
+	Text          string           `json:"text"`
 	// Format is a common host-facing field. Set "markdown" for rich rendering;
 	// each SDK maps it to platform-native delivery or falls back internally.
 	Format string `json:"format,omitempty"`

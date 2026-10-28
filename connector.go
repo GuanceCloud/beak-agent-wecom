@@ -71,6 +71,7 @@ func (c Connector) Metadata() sdk.ConnectorMetadata {
 		Label:       meta.Label,
 		Description: meta.Description,
 		Capabilities: sdk.Capabilities{
+			Interactions:     sdk.InteractionCapabilities{ToolApproval: true, PlanConfirmation: true, Update: "callback"},
 			LoginModes:       []string{sdk.LoginModeCredential},
 			Text:             caps.Text,
 			Media:            caps.Media,
@@ -288,6 +289,9 @@ func (c Connector) Send(ctx context.Context, runtime sdk.Runtime, req sdk.Outbou
 	accountUUID := accountKey(account)
 	if strings.TrimSpace(req.ChatID) == "" {
 		return nil, fmt.Errorf("wecom outbound chat_id is required")
+	}
+	if req.Interaction != nil {
+		return sendWecomInteraction(ctx, runtime, req)
 	}
 	if strings.TrimSpace(req.Text) == "" && len(req.Attachments) == 0 {
 		return nil, fmt.Errorf("wecom outbound text or attachments are required")

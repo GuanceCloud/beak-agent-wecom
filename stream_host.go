@@ -144,6 +144,13 @@ func (c Connector) HandleStreamFrame(ctx context.Context, runtime sdk.Runtime, a
 			return out, nil
 		default:
 			out.ResponseTo = frame.Headers.RequestID
+			if frame.ErrCode != 0 {
+				// Message-level API rejections belong to the correlated caller,
+				// not the connection lifecycle. The host forwards the raw ack
+				// so Send can fail while subsequent callbacks keep arriving.
+				out.HealthUpdates[sdk.RuntimeHealthKeyStreamLastError] = fmt.Sprintf("wecom stream response rejected: code=%d", frame.ErrCode)
+				out.HealthUpdates[sdk.RuntimeHealthKeyStreamLastErrorAt] = now
+			}
 			return out, nil
 		}
 	}
@@ -161,7 +168,10 @@ func (c Connector) HandleStreamFrame(ctx context.Context, runtime sdk.Runtime, a
 		if err != nil {
 			return out, err
 		}
-		eventType := strings.TrimSpace(stringValue(message.Event["eventtype"]))
+		eventType := strings.TrimSpace(message.Event.EventType)
+		if eventType == "template_card_event" {
+			return handleWecomInteraction(ctx, runtime, account, frame, message, out)
+		}
 		if eventType == platform.EventDisconnected {
 			out.CloseReason = "wecom server disconnected this connection because another connection was established"
 			out.Terminal = true

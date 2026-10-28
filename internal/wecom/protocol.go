@@ -46,22 +46,47 @@ type FrameHeaders struct {
 }
 
 type Message struct {
-	MessageID   string         `json:"msgid"`
-	BotID       string         `json:"aibotid"`
-	ChatID      string         `json:"chatid,omitempty"`
-	ChatType    string         `json:"chattype"`
-	From        MessageFrom    `json:"from"`
-	CreateTime  int64          `json:"create_time,omitempty"`
-	ResponseURL string         `json:"response_url,omitempty"`
-	MessageType string         `json:"msgtype"`
-	Text        *TextContent   `json:"text,omitempty"`
-	Image       *MediaContent  `json:"image,omitempty"`
-	Mixed       *MixedContent  `json:"mixed,omitempty"`
-	Voice       *TextContent   `json:"voice,omitempty"`
-	File        *MediaContent  `json:"file,omitempty"`
-	Video       *MediaContent  `json:"video,omitempty"`
-	Quote       *QuoteContent  `json:"quote,omitempty"`
-	Event       map[string]any `json:"event,omitempty"`
+	MessageID   string        `json:"msgid"`
+	BotID       string        `json:"aibotid"`
+	ChatID      string        `json:"chatid,omitempty"`
+	ChatType    string        `json:"chattype"`
+	From        MessageFrom   `json:"from"`
+	CreateTime  int64         `json:"create_time,omitempty"`
+	ResponseURL string        `json:"response_url,omitempty"`
+	MessageType string        `json:"msgtype"`
+	Text        *TextContent  `json:"text,omitempty"`
+	Image       *MediaContent `json:"image,omitempty"`
+	Mixed       *MixedContent `json:"mixed,omitempty"`
+	Voice       *TextContent  `json:"voice,omitempty"`
+	File        *MediaContent `json:"file,omitempty"`
+	Video       *MediaContent `json:"video,omitempty"`
+	Quote       *QuoteContent `json:"quote,omitempty"`
+	Event       MessageEvent  `json:"event,omitempty"`
+}
+
+// MessageEvent owns the structured event payload. Card fields are normalized
+// once at the platform boundary, rather than passed as untyped nested maps.
+type MessageEvent struct {
+	EventType         string             `json:"eventtype"`
+	TemplateCardEvent *TemplateCardEvent `json:"template_card_event,omitempty"`
+	EventKey          string             `json:"event_key,omitempty"`
+	TaskID            string             `json:"task_id,omitempty"`
+}
+
+type TemplateCardEvent struct {
+	EventKey string `json:"event_key"`
+	TaskID   string `json:"task_id"`
+}
+
+func (e MessageEvent) CardAction() (TemplateCardEvent, error) {
+	if e.TemplateCardEvent != nil {
+		card := *e.TemplateCardEvent
+		if (e.EventKey != "" && e.EventKey != card.EventKey) || (e.TaskID != "" && e.TaskID != card.TaskID) {
+			return TemplateCardEvent{}, fmt.Errorf("wecom conflicting template card fields")
+		}
+		return card, nil
+	}
+	return TemplateCardEvent{EventKey: e.EventKey, TaskID: e.TaskID}, nil
 }
 
 type MessageFrom struct {
