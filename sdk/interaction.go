@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -50,6 +51,8 @@ type PlanConfirmationDetails struct {
 // update of a previously sent card. CallbackID is only used inside a platform's
 // callback update window. Platform payloads must remain inside the connector.
 type InteractionCard struct {
+	// Language is the host-resolved reply language, fixed for this request.
+	Language         string                   `json:"language,omitempty"`
 	PlanConfirmation *PlanConfirmationDetails `json:"plan_confirmation,omitempty"`
 	ToolApproval     *ToolApprovalDetails     `json:"tool_approval,omitempty"`
 	TemplateID       string                   `json:"template_id,omitempty"`
@@ -63,7 +66,8 @@ type InteractionCard struct {
 	Inputs           []InteractionInput       `json:"inputs,omitempty"`
 	MessageID        string                   `json:"message_id,omitempty"`
 	CallbackID       string                   `json:"callback_id,omitempty"`
-	WebURL           string                   `json:"web_url,omitempty"`
+	// Deprecated: WebURL is ignored. Decisions must stay on the originating IM.
+	WebURL string `json:"web_url,omitempty"`
 }
 
 // ActorID and chat/message identity come from the verified platform envelope,
@@ -202,4 +206,32 @@ func (c InteractionCard) Validate() error {
 
 func (c InteractionCard) ButtonToken(button InteractionButton) (string, error) {
 	return (InteractionAction{RequestID: c.RequestID, Revision: c.Revision, ActionID: button.ID}).Token()
+}
+
+// ResolveInteractionLanguage accepts supported language tags and otherwise uses
+// the platform default. It never detects language from user or model content.
+func ResolveInteractionLanguage(platform, language string) string {
+	language = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(language, "_", "-")))
+	switch strings.SplitN(language, "-", 2)[0] {
+	case "zh":
+		return "zh"
+	case "en":
+		return "en"
+	}
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "feishu", "dingtalk", "wecom", "weixin", "wechat":
+		return "zh"
+	default:
+		return "en"
+	}
+}
+
+// InteractionErrorLanguage reads only trusted host error metadata. Callback
+// payloads cannot choose the language of another member's approval request.
+func InteractionErrorLanguage(platform string, err error) string {
+	var localized interface{ InteractionLanguage() string }
+	if errors.As(err, &localized) {
+		return ResolveInteractionLanguage(platform, localized.InteractionLanguage())
+	}
+	return ResolveInteractionLanguage(platform, "")
 }

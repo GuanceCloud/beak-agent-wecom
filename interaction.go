@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/GuanceCloud/beak-agent-wecom/internal/locale"
 	platform "github.com/GuanceCloud/beak-agent-wecom/internal/wecom"
 	"github.com/GuanceCloud/beak-agent-wecom/sdk"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 )
 
 func wecomInteractionCard(card sdk.InteractionCard) (map[string]any, error) {
+	tr := locale.Translator(sdk.ResolveInteractionLanguage("wecom", card.Language))
 	if err := card.Validate(); err != nil {
 		return nil, err
 	}
@@ -49,9 +51,9 @@ func wecomInteractionCard(card sdk.InteractionCard) (map[string]any, error) {
 			if card.Kind == "plan_confirmation" {
 				switch button.ID {
 				case "approve":
-					label = "批准"
+					label = tr("Approve")
 				case "revise":
-					label = "修改"
+					label = tr("Revise")
 				}
 			}
 			style := 1
@@ -137,14 +139,15 @@ func handleWecomInteraction(ctx context.Context, runtime sdk.Runtime, account sd
 	if err != nil {
 		var access interface{ InteractionErrorCode() string }
 		if errors.As(err, &access) && access.InteractionErrorCode() == "actor_not_requester" {
+			tr := locale.Translator(sdk.InteractionErrorLanguage("wecom", err))
 			// Only replace the clicking member's view. Other members keep their
 			// original card and the host has not recorded an approval decision.
 			card := map[string]any{
 				"card_type":    "button_interaction",
 				"task_id":      cardAction.TaskID,
-				"main_title":   map[string]string{"title": "无法审批", "desc": "只有本次任务的发起人可以审批，请联系发起人处理。"},
-				"button_list":  []map[string]any{{"text": "请联系发起人", "key": cardAction.EventKey, "style": 4}},
-				"replace_text": "请联系发起人",
+				"main_title":   map[string]string{"title": tr("Approval unavailable"), "desc": tr("Only the requester can decide this approval. Please contact the requester.")},
+				"button_list":  []map[string]any{{"text": tr("Contact the requester"), "key": cardAction.EventKey, "style": 4}},
+				"replace_text": tr("Contact the requester"),
 			}
 			payload, marshalErr := platform.MarshalFrame(platform.Frame{Command: "aibot_respond_update_msg", Headers: frame.Headers, Body: map[string]any{
 				"response_type": "update_template_card", "userids": []string{action.ActorID}, "template_card": card,
@@ -214,77 +217,79 @@ func handleWecomInteraction(ctx context.Context, runtime sdk.Runtime, account sd
 }
 
 func wecomInteractionStateLabel(card sdk.InteractionCard) string {
+	tr := locale.Translator(sdk.ResolveInteractionLanguage("wecom", card.Language))
 	if detail := card.PlanConfirmation; detail != nil && card.State == "rejected" && detail.DecisionAction == "revise" {
 		if detail.AwaitingRevisionInput {
-			return "待补充修改意见"
+			return tr("Awaiting change details")
 		}
-		return "已要求修改"
+		return tr("Changes requested")
 	}
 	switch card.State {
 	case "approved":
-		return "已批准"
+		return tr("Approved")
 	case "rejected":
-		return "已拒绝"
+		return tr("Rejected")
 	case "canceled":
-		return "已取消"
+		return tr("Canceled")
 	case "expired":
-		return "已过期"
+		return tr("Expired")
 	default:
 		if card.Kind == "tool_approval" {
-			return "待审批"
+			return tr("Awaiting approval")
 		}
-		return "待确认"
+		return tr("Awaiting confirmation")
 	}
 }
 
 // The platform renders native fields, not Markdown. Use only host-redacted display
 // data; never infer tool identity, authorization, or lifecycle from summary text.
 func styleWecomToolApproval(value map[string]any, card sdk.InteractionCard) {
+	tr := locale.Translator(sdk.ResolveInteractionLanguage("wecom", card.Language))
 	color := 1
-	hint := "请确认执行内容，批准后才会继续"
+	hint := tr("Review the operation. Execution continues only after approval.")
 	switch card.State {
 	case "approved":
-		color, hint = 3, "已允许执行，实际结果请查看后续回复"
+		color, hint = 3, tr("Execution authorized. See the following reply for results.")
 	case "rejected":
-		color, hint = 2, "已拒绝本次操作，不会执行"
+		color, hint = 2, tr("Operation rejected. It will not execute.")
 	case "canceled":
-		color, hint = 0, "本次审批已取消，请以最新请求为准"
+		color, hint = 0, tr("Approval canceled. Refer to the latest request.")
 	case "expired":
-		color, hint = 0, "本次审批已过期，请重新发起请求"
+		color, hint = 0, tr("Approval expired. Send a new request.")
 	}
 	if card.ToolApproval != nil && card.ToolApproval.ResolutionText != "" && (card.State == "canceled" || card.State == "expired") {
 		hint = card.ToolApproval.ResolutionText
 	}
-	value["source"] = map[string]any{"desc": "操作审批 · " + wecomInteractionStateLabel(card), "desc_color": color}
-	value["main_title"] = map[string]string{"title": "确认工具操作", "desc": hint}
+	value["source"] = map[string]any{"desc": tr("Tool approval · ") + wecomInteractionStateLabel(card), "desc_color": color}
+	value["main_title"] = map[string]string{"title": tr("Confirm tool operation"), "desc": hint}
 	detail := card.ToolApproval
 	if detail == nil {
 		value["sub_title_text"] = wecomDisplayPreview(card.Summary, 112)
 		return
 	}
-	risk := "需确认"
+	risk := tr("Review required")
 	switch detail.RiskLevel {
 	case "dangerous", "high":
-		risk = "高风险"
+		risk = tr("High risk")
 	case "medium":
-		risk = "中风险"
+		risk = tr("Medium risk")
 	case "low", "safe":
-		risk = "低风险"
+		risk = tr("Low risk")
 	}
 	value["horizontal_content_list"] = []map[string]string{
-		{"keyname": "执行工具", "value": wecomDisplayPreview(detail.ToolName, 26)},
-		{"keyname": "风险等级", "value": risk},
+		{"keyname": tr("Tool"), "value": wecomDisplayPreview(detail.ToolName, 26)},
+		{"keyname": tr("Risk level"), "value": risk},
 	}
 	preview := strings.TrimSpace(detail.ArgumentsPreview)
 	if preview == "" {
-		preview = "未提供参数预览，请先向发起人确认执行内容。"
+		preview = tr("No argument preview provided. Confirm the operation with the requester first.")
 	}
-	title := "执行内容（已脱敏）"
+	title := tr("Operation (redacted)")
 	if detail.ArgumentsTruncated || len([]rune(preview)) > 280 {
-		title = "执行内容（摘要）"
+		title = tr("Operation (preview)")
 	}
 	value["quote_area"] = map[string]any{"type": 0, "title": title, "quote_text": wecomDisplayPreview(preview, 280)}
-	value["sub_title_text"] = "仅对本次请求作出决定，敏感参数已隐藏。"
+	value["sub_title_text"] = tr("Decide only this request. Sensitive values are hidden.")
 }
 
 func wecomDisplayPreview(value string, limit int) string {
