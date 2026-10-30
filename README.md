@@ -146,3 +146,7 @@ Also run the workspace `beak-channel-sdk-conformance` and `beak-channel-sdk-conf
 - Logs may include account UUID, Bot ID, request ID, and platform error code, but never the full authentication frame.
 - `NativeRuntime.WebSocketURL` is a test or controlled-deployment override. It is not part of `CredentialSchema` and must not be shown to ordinary users.
 - Do not call `ValidateCredential` as a heartbeat. Runtime health comes from the active host-owned stream.
+
+## Approval details delivery
+
+Native WeCom clients may collapse the operation preview. The host sends complete redacted details before the actionable card, using the same approval request ID. The card now labels its quote area as a preview and displays that request ID. The host owns durable delivery progress and must not send an actionable card before details are acknowledged. Terminal callbacks continue updating the original card.

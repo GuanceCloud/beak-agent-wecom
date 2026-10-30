@@ -284,12 +284,10 @@ func styleWecomToolApproval(value map[string]any, card sdk.InteractionCard) {
 	if preview == "" {
 		preview = tr("No argument preview provided. Confirm the operation with the requester first.")
 	}
-	title := tr("Operation (redacted)")
-	if detail.ArgumentsTruncated || len([]rune(preview)) > 280 {
-		title = tr("Operation (preview)")
-	}
+	// Native clients may collapse even short quote areas; details are delivered separately by the host.
+	title := tr("Operation (preview)")
 	value["quote_area"] = map[string]any{"type": 0, "title": title, "quote_text": wecomDisplayPreview(preview, 280)}
-	value["sub_title_text"] = tr("Decide only this request. Sensitive values are hidden.")
+	value["sub_title_text"] = tr("Request: ") + card.RequestID
 }
 
 func wecomDisplayPreview(value string, limit int) string {

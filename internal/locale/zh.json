@@ -28,5 +28,6 @@
   "No argument preview provided. Confirm the operation with the requester first.": "未提供参数预览，请先向发起人确认执行内容。",
   "Operation (redacted)": "执行内容（已脱敏）",
   "Operation (preview)": "执行内容（摘要）",
-  "Decide only this request. Sensitive values are hidden.": "仅对本次请求作出决定，敏感参数已隐藏。"
+  "Decide only this request. Sensitive values are hidden.": "仅对本次请求作出决定，敏感参数已隐藏。",
+  "Request: ": "审批编号："
 }
