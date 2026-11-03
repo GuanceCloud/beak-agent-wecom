@@ -2,8 +2,10 @@ package beakwecom
 
 import (
 	"context"
+	"encoding/json"
 	platform "github.com/GuanceCloud/beak-agent-wecom/internal/wecom"
 	"github.com/GuanceCloud/beak-agent-wecom/sdk"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -16,6 +18,13 @@ type cardGateway struct {
 
 type deniedCardGateway struct{ testGateway }
 type requesterDenied struct{}
+
+func (requesterDenied) InteractionRequesterName() string { return "金磊" }
+func (requesterDenied) InteractionCard() *sdk.InteractionCard {
+	return &sdk.InteractionCard{RequestID: "approval_123", Revision: 2, Kind: "tool_approval", State: "pending", Title: "操作审批", Language: "zh",
+		ToolApproval: &sdk.ToolApprovalDetails{ToolName: "bash", RiskLevel: "high", ArgumentsPreview: strings.Repeat("完整命令", 100)},
+		Actions:      []sdk.InteractionButton{{ID: "approve", Label: "批准"}, {ID: "reject", Label: "拒绝"}}}
+}
 
 func (requesterDenied) Error() string                { return "denied" }
 func (requesterDenied) InteractionErrorCode() string { return "actor_not_requester" }
@@ -40,9 +49,27 @@ func TestWecomNonRequesterFeedbackTargetsOnlyClicker(t *testing.T) {
 		t.Fatalf("unexpected target: %#v", frame.Body["userids"])
 	}
 	card, ok := frame.Body["template_card"].(map[string]any)
-	if !ok || card["task_id"] != "approval_123_2" || !strings.Contains(card["main_title"].(map[string]any)["desc"].(string), "发起人") {
+	if !ok || card["task_id"] != "approval_123_2" || card["replace_text"] != "无法审批，只有金磊才可以审批" {
 		t.Fatalf("unexpected feedback: %#v", card)
 	}
+	original, err := wecomInteractionCard(*requesterDenied{}.InteractionCard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(original)
+	var normalized map[string]any
+	if err := json.Unmarshal(raw, &normalized); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"main_title", "source", "quote_area", "sub_title_text", "horizontal_content_list", "task_id", "card_type"} {
+		if !reflect.DeepEqual(card[key], normalized[key]) {
+			t.Fatalf("original %s changed: got=%v want=%v", key, card[key], normalized[key])
+		}
+	}
+	if card["quote_area"].(map[string]any)["quote_text"] != (requesterDenied{}).InteractionCard().ToolApproval.ArgumentsPreview {
+		t.Fatal("full command truncated")
+	}
+
 }
 
 func (g *cardGateway) HandleInteraction(_ context.Context, a sdk.InteractionAction) (*sdk.InteractionResult, error) {

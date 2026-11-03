@@ -12,6 +12,19 @@ import (
 	"time"
 )
 
+// interactionAccessFeedback is an optional authenticated host error contract.
+// The snapshot must belong to the verified account, conversation and request.
+// It is display-only; private feedback is not an approval decision. When using
+// CallbackInteractionGateway, the host holds its delivery lease until Complete
+// is called, including when returning this error. Missing snapshots leave the
+// original card unchanged.
+type interactionAccessFeedback interface {
+	error
+	InteractionErrorCode() string
+	InteractionCard() *sdk.InteractionCard
+	InteractionRequesterName() string
+}
+
 func wecomInteractionCard(card sdk.InteractionCard) (map[string]any, error) {
 	tr := locale.Translator(sdk.ResolveInteractionLanguage("wecom", card.Language))
 	if err := card.Validate(); err != nil {
@@ -136,76 +149,62 @@ func handleWecomInteraction(ctx context.Context, runtime sdk.Runtime, account sd
 	} else {
 		result, err = sdk.DispatchInteraction(callbackCtx, runtime, action)
 	}
-	if err != nil {
-		var access interface{ InteractionErrorCode() string }
-		if errors.As(err, &access) && access.InteractionErrorCode() == "actor_not_requester" {
-			tr := locale.Translator(sdk.InteractionErrorLanguage("wecom", err))
-			// Only replace the clicking member's view. Other members keep their
-			// original card and the host has not recorded an approval decision.
-			card := map[string]any{
-				"card_type":    "button_interaction",
-				"task_id":      cardAction.TaskID,
-				"main_title":   map[string]string{"title": tr("Approval unavailable"), "desc": tr("Only the requester can decide this approval. Please contact the requester.")},
-				"button_list":  []map[string]any{{"text": tr("Contact the requester"), "key": cardAction.EventKey, "style": 4}},
-				"replace_text": tr("Contact the requester"),
-			}
-			payload, marshalErr := platform.MarshalFrame(platform.Frame{Command: "aibot_respond_update_msg", Headers: frame.Headers, Body: map[string]any{
-				"response_type": "update_template_card", "userids": []string{action.ActorID}, "template_card": card,
-			}})
-			if marshalErr != nil {
-				return out, marshalErr
-			}
-			response := sdk.StreamFrame{MessageType: sdk.StreamMessageTypeText, Data: payload}
-			response.ACK = &sdk.StreamFrameACK{
-				CorrelationID: frame.Headers.RequestID,
-				Timeout:       streamRequestTimeout,
-				Complete: func(response *sdk.StreamResponse, ackErr error) {
-					if runtime.Logger == nil {
-						return
-					}
-					if ackErr != nil || response == nil {
-						runtime.Logger.Printf("wecom private approval feedback was not acknowledged")
-						return
-					}
-					ack, parseErr := platform.ParseFrame(response.Frame.Data)
-					if parseErr != nil || ack.ErrCode != 0 {
-						runtime.Logger.Printf("wecom private approval feedback was rejected")
-					}
-				},
-			}
-			out.ResponseFrames = []sdk.StreamFrame{response}
-			out.EventResult = &sdk.StreamEventResult{Type: "interaction"}
-			return out, nil
-		}
-		return out, err
-	}
 	installed := false
 	defer func() {
 		if !installed && complete != nil {
 			complete(false)
 		}
 	}()
+	var denied interactionAccessFeedback
+	if err != nil {
+		// A trusted host snapshot is required: never erase the original evidence
+		// or reconstruct it from the callback's untrusted display fields.
+		if !errors.As(err, &denied) || denied.InteractionErrorCode() != "actor_not_requester" {
+			return out, err
+		}
+		card := denied.InteractionCard()
+		if card == nil || card.RequestID != action.RequestID || card.Revision != action.Revision ||
+			strings.TrimSpace(denied.InteractionRequesterName()) == "" {
+			return out, err
+		}
+		result = &sdk.InteractionResult{State: card.State, Card: card}
+	}
 	if result != nil && result.Card != nil {
 		card, err := wecomInteractionCard(*result.Card)
 		if err != nil {
 			return out, err
 		}
-		payload, err := platform.MarshalFrame(platform.Frame{Command: "aibot_respond_update_msg", Headers: frame.Headers, Body: map[string]any{"response_type": "update_template_card", "template_card": card}})
+		body := map[string]any{"response_type": "update_template_card", "template_card": card}
+		if denied != nil {
+			body["userids"] = []string{action.ActorID}
+			if result.Card.State == "pending" {
+				tr := locale.Translator(sdk.ResolveInteractionLanguage("wecom", result.Card.Language))
+				label := fmt.Sprintf(tr("Approval unavailable. Only %s can decide this approval."), denied.InteractionRequesterName())
+				card["button_list"] = []map[string]any{{"text": tr("Approval unavailable"), "key": cardAction.EventKey, "style": 4}}
+				card["replace_text"] = label
+			}
+		}
+		payload, err := platform.MarshalFrame(platform.Frame{Command: "aibot_respond_update_msg", Headers: frame.Headers, Body: body})
 		if err != nil {
 			return out, err
 		}
 		response := sdk.StreamFrame{MessageType: sdk.StreamMessageTypeText, Data: payload}
-		if complete != nil {
+		if complete != nil || denied != nil {
 			response.ACK = &sdk.StreamFrameACK{
 				CorrelationID: frame.Headers.RequestID,
 				Timeout:       streamRequestTimeout,
 				Complete: func(response *sdk.StreamResponse, ackErr error) {
-					if ackErr != nil || response == nil {
-						complete(false)
-						return
+					success := false
+					if ackErr == nil && response != nil {
+						ack, parseErr := platform.ParseFrame(response.Frame.Data)
+						success = parseErr == nil && ack.ErrCode == 0
 					}
-					ack, parseErr := platform.ParseFrame(response.Frame.Data)
-					complete(parseErr == nil && ack.ErrCode == 0)
+					if complete != nil {
+						complete(success)
+					}
+					if !success && runtime.Logger != nil {
+						runtime.Logger.Printf("wecom approval update was not acknowledged or was rejected")
+					}
 				},
 			}
 			installed = true
@@ -284,9 +283,10 @@ func styleWecomToolApproval(value map[string]any, card sdk.InteractionCard) {
 	if preview == "" {
 		preview = tr("No argument preview provided. Confirm the operation with the requester first.")
 	}
-	// Native clients may collapse even short quote areas; details are delivered separately by the host.
+	// Keep the full host-redacted arguments in the sole approval card.
+	// Clients may collapse the quote visually; do not truncate its payload.
 	title := tr("Operation (preview)")
-	value["quote_area"] = map[string]any{"type": 0, "title": title, "quote_text": wecomDisplayPreview(preview, 280)}
+	value["quote_area"] = map[string]any{"type": 0, "title": title, "quote_text": preview}
 	value["sub_title_text"] = tr("Request: ") + card.RequestID
 }
 

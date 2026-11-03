@@ -213,3 +213,9 @@ go test ./...
 - 日志可记录 account UUID、Bot ID、`req_id` 和错误码，但不能记录完整鉴权帧。
 - `NativeRuntime.WebSocketURL` 只用于测试或受控部署覆盖，不属于 CredentialSchema，也不能暴露给普通用户。
 - 不要用 `ValidateCredential` 做周期性 heartbeat；运行时健康由 host-owned stream 的标准 health 字段判断。
+
+## 审批卡片展示
+
+工具审批在一张卡片中携带完整的脱敏参数；宿主不应再发送重复的审批详情消息。原生客户端可能折叠参数区域，SDK 不截断该区域的参数数据。
+
+非发起人点击时，宿主通过可选错误接口（`InteractionErrorCode`、`InteractionCard`、`InteractionRequesterName`）返回经过账号、群聊和审批身份校验的原卡片快照及发起人姓名。连接器只针对点击者更新原卡片的按钮区域为“无法审批，只有 XXX 才可以审批”，保留标题、命令、审批编号、工具和风险信息。无快照时保留原卡片；已结束的审批保持最终状态。宿主需协调私有更新的 ACK 与后续终态更新，防止旧提示覆盖新决定。
