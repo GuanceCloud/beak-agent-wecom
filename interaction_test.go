@@ -19,7 +19,6 @@ type cardGateway struct {
 type deniedCardGateway struct{ testGateway }
 type requesterDenied struct{}
 
-func (requesterDenied) InteractionRequesterName() string { return "金磊" }
 func (requesterDenied) InteractionCard() *sdk.InteractionCard {
 	return &sdk.InteractionCard{RequestID: "approval_123", Revision: 2, Kind: "tool_approval", State: "pending", Title: "操作审批", Language: "zh",
 		ToolApproval: &sdk.ToolApprovalDetails{ToolName: "bash", RiskLevel: "high", ArgumentsPreview: strings.Repeat("完整命令", 100)},
@@ -44,12 +43,18 @@ func TestWecomNonRequesterFeedbackTargetsOnlyClicker(t *testing.T) {
 		t.Fatal("private feedback must observe the platform acknowledgement")
 	}
 	frame := mustParseFrame(t, result.ResponseFrames[0].Data)
+	// Permission denial sends only the private card update. There is no
+	// application-generated success acknowledgement or popup message.
+	if frame.Command != "aibot_respond_update_msg" || frame.ErrMsg != "" ||
+		frame.Body["response_type"] != "update_template_card" {
+		t.Fatalf("unexpected denial response: %+v", frame)
+	}
 	users, ok := frame.Body["userids"].([]any)
 	if !ok || len(users) != 1 || users[0] != "other-member" {
 		t.Fatalf("unexpected target: %#v", frame.Body["userids"])
 	}
 	card, ok := frame.Body["template_card"].(map[string]any)
-	if !ok || card["task_id"] != "approval_123_2" || card["replace_text"] != "无法审批，只有金磊才可以审批" {
+	if !ok || card["task_id"] != "approval_123_2" || card["replace_text"] != "无法审批，你没有审批权限" {
 		t.Fatalf("unexpected feedback: %#v", card)
 	}
 	original, err := wecomInteractionCard(*requesterDenied{}.InteractionCard())

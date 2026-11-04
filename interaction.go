@@ -22,7 +22,6 @@ type interactionAccessFeedback interface {
 	error
 	InteractionErrorCode() string
 	InteractionCard() *sdk.InteractionCard
-	InteractionRequesterName() string
 }
 
 func wecomInteractionCard(card sdk.InteractionCard) (map[string]any, error) {
@@ -163,8 +162,7 @@ func handleWecomInteraction(ctx context.Context, runtime sdk.Runtime, account sd
 			return out, err
 		}
 		card := denied.InteractionCard()
-		if card == nil || card.RequestID != action.RequestID || card.Revision != action.Revision ||
-			strings.TrimSpace(denied.InteractionRequesterName()) == "" {
+		if card == nil || card.RequestID != action.RequestID || card.Revision != action.Revision {
 			return out, err
 		}
 		result = &sdk.InteractionResult{State: card.State, Card: card}
@@ -179,7 +177,7 @@ func handleWecomInteraction(ctx context.Context, runtime sdk.Runtime, account sd
 			body["userids"] = []string{action.ActorID}
 			if result.Card.State == "pending" {
 				tr := locale.Translator(sdk.ResolveInteractionLanguage("wecom", result.Card.Language))
-				label := fmt.Sprintf(tr("Approval unavailable. Only %s can decide this approval."), denied.InteractionRequesterName())
+				label := tr("Approval unavailable. You do not have permission to approve.")
 				card["button_list"] = []map[string]any{{"text": tr("Approval unavailable"), "key": cardAction.EventKey, "style": 4}}
 				card["replace_text"] = label
 			}

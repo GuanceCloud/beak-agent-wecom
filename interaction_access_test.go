@@ -56,7 +56,7 @@ func TestPrivateFeedbackPreservesTerminalStateAndCompletesLease(t *testing.T) {
 					payload := frame.Body["template_card"].(map[string]any)
 					want := wecomInteractionStateLabel(*card)
 					if state == "pending" {
-						want = "Approval unavailable. Only 金磊 can decide this approval."
+						want = "Approval unavailable. You do not have permission to approve."
 					}
 					if payload["replace_text"] != want {
 						t.Fatalf("state overwritten: %v", payload)
