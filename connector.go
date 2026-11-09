@@ -537,7 +537,7 @@ func uploadWecomMedia(ctx context.Context, stream sdk.StreamTransport, kind, fil
 		if err != nil {
 			return "", err
 		}
-		chunkFrame, err := platform.MarshalFrame(platform.UploadMediaChunkFrame(chunkID, uploadID, index+1, base64.StdEncoding.EncodeToString(data[start:end])))
+		chunkFrame, err := platform.MarshalFrame(platform.UploadMediaChunkFrame(chunkID, uploadID, index, base64.StdEncoding.EncodeToString(data[start:end])))
 		if err != nil {
 			return "", err
 		}

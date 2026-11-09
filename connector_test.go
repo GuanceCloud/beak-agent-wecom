@@ -245,38 +245,67 @@ func TestSendUsesHostStreamAndSplitsUTF8Safely(t *testing.T) {
 	}
 }
 
-func TestSendUploadsLocalAttachmentBeforeSendingMediaMessage(t *testing.T) {
+func TestSendUploadsGroupAttachmentsWithZeroBasedChunks(t *testing.T) {
 	account := testAccount()
 	transport := &mediaTestStreamTransport{}
 	runtime := testRuntime(account, &testGateway{}, &testAccountStore{})
 	runtime.Stream = transport
-	path := filepath.Join(t.TempDir(), "photo.png")
-	if err := os.WriteFile(path, []byte("image-bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	result, err := (Connector{}).Send(context.Background(), runtime, sdk.OutboundMessage{
-		AccountUUID: account.UUID,
-		MessageUUID: "message-media-1",
-		ChatType:    sdk.ChatTypeDirect,
-		ChatID:      "user-1",
-		Attachments: []sdk.MediaAttachment{{ID: "asset-1", Kind: sdk.MediaKindImage, Source: sdk.MediaSourcePath, Path: path, FileName: "photo.png"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result == nil || len(result.AttachmentResults) != 1 || result.AttachmentResults[0].Status != sdk.AttachmentStatusSent {
-		t.Fatalf("result=%+v", result)
-	}
-	if len(transport.requests) != 4 {
-		t.Fatalf("requests=%d, want init+chunk+finish+send", len(transport.requests))
-	}
-	frame := mustParseFrame(t, transport.requests[3].Frame.Data)
-	if frame.Command != platform.CommandSendMessage {
-		t.Fatalf("send frame=%+v", frame)
-	}
-	image, _ := frame.Body[platform.MessageTypeImage].(map[string]any)
-	if image["media_id"] != "media-1" {
-		t.Fatalf("media body=%+v", image)
+	for _, media := range []struct {
+		name   string
+		kind   string
+		data   string
+		chunks int
+	}{
+		{"photo.png", sdk.MediaKindImage, "image-bytes", 1},
+		{"report.pdf", sdk.MediaKindFile, strings.Repeat("x", wecomMediaChunkBytes) + "last-byte", 2},
+	} {
+		t.Run(media.name, func(t *testing.T) {
+			transport.requests = nil
+			path := filepath.Join(t.TempDir(), media.name)
+			if err := os.WriteFile(path, []byte(media.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			result, err := (Connector{}).Send(context.Background(), runtime, sdk.OutboundMessage{
+				AccountUUID: account.UUID,
+				MessageUUID: "message-" + media.name,
+				ChatType:    sdk.ChatTypeGroup,
+				ChatID:      "group-1",
+				Attachments: []sdk.MediaAttachment{
+					{ID: "asset-1", Kind: media.kind, Source: sdk.MediaSourcePath, Path: path, FileName: media.name},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result == nil || len(result.AttachmentResults) != 1 || result.AttachmentResults[0].Status != sdk.AttachmentStatusSent {
+				t.Fatalf("result=%+v", result)
+			}
+			if len(transport.requests) != media.chunks+3 {
+				t.Fatalf("requests=%d, want init+%d chunks+finish+send", len(transport.requests), media.chunks)
+			}
+			init := mustParseFrame(t, transport.requests[0].Frame.Data)
+			if init.Command != platform.CommandUploadInit || init.Body["total_chunks"] != float64(media.chunks) ||
+				init.Body["filename"] != media.name || init.Body["type"] != media.kind {
+				t.Fatalf("init frame=%+v", init)
+			}
+			for index := 0; index < media.chunks; index++ {
+				frame := mustParseFrame(t, transport.requests[index+1].Frame.Data)
+				if frame.Command != platform.CommandUploadChunk || frame.Body["chunk_index"] != float64(index) ||
+					frame.Body["upload_id"] != "upload-1" {
+					t.Fatalf("chunk %d: command=%s index=%v upload_id=%v", index, frame.Command, frame.Body["chunk_index"], frame.Body["upload_id"])
+				}
+			}
+			finish := mustParseFrame(t, transport.requests[media.chunks+1].Frame.Data)
+			if finish.Command != platform.CommandUploadFinish || finish.Body["upload_id"] != "upload-1" {
+				t.Fatalf("finish frame=%+v", finish)
+			}
+			send := mustParseFrame(t, transport.requests[media.chunks+2].Frame.Data)
+			content, _ := send.Body[media.kind].(map[string]any)
+			if send.Command != platform.CommandSendMessage || send.Body["chatid"] != "group-1" ||
+				send.Body["msgtype"] != media.kind || content["media_id"] != "media-1" {
+				t.Fatalf("send frame=%+v", send)
+			}
+		})
 	}
 }
 
