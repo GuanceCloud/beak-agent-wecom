@@ -45,6 +45,7 @@ type NativeRuntime struct {
 	Dialer       *websocket.Dialer
 	// ConversationDisplayName supplies cached names scoped to this bot account.
 	ConversationDisplayName func(chatType, chatID string) string
+	DirectoryNames          *DirectoryNameResolver
 }
 
 type Connector struct{ channel Channel }
@@ -119,6 +120,16 @@ func (Connector) ValidateCredential(ctx context.Context, req sdk.CredentialValid
 	}
 	credential["bot_id"] = botID
 	credential["secret"] = secret
+
+	corpID := strings.TrimSpace(stringValue(credential[DirectoryCorpIDField]))
+	directorySecret := strings.TrimSpace(stringValue(credential[DirectorySecretField]))
+	if (corpID == "") != (directorySecret == "") {
+		return credentialValidationFailure(credential, state, "corp_id and directory_app_secret must be configured together"), nil
+	}
+	if corpID != "" {
+		credential[DirectoryCorpIDField] = corpID
+		credential[DirectorySecretField] = directorySecret
+	}
 
 	native := nativeRuntime(req.Runtime.Native)
 	endpoint := strings.TrimSpace(native.WebSocketURL)

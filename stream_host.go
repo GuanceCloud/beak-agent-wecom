@@ -233,11 +233,15 @@ func (c Connector) processMessageFrame(ctx context.Context, runtime sdk.Runtime,
 	}
 
 	inbound := buildInboundMessage(runtime, accountUUID, message, chatType, chatID, text, dedupeKey)
-	if lookup := nativeRuntime(runtime.Native).ConversationDisplayName; lookup != nil {
+	native := nativeRuntime(runtime.Native)
+	if lookup := native.ConversationDisplayName; lookup != nil {
 		inbound.ChatIdentity.DisplayName = lookup(chatType, chatID)
-		if chatType == sdk.ChatTypeDirect {
-			inbound.SenderDisplayName = inbound.ChatIdentity.DisplayName
+	}
+	if chatType == sdk.ChatTypeDirect {
+		if inbound.ChatIdentity.DisplayName == "" {
+			inbound.ChatIdentity.DisplayName = native.DirectoryNames.DisplayName(ctx, message.From.CorpID, senderID)
 		}
+		inbound.SenderDisplayName = inbound.ChatIdentity.DisplayName
 	}
 	inbound.Attachments = attachments
 	if len(attachmentErrors) > 0 {

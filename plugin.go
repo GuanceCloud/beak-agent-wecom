@@ -87,6 +87,17 @@ func (Channel) SettingsSchema() SettingsSchema {
 				"description": "企业微信智能机器人的 Secret。",
 				"secret":      true,
 			},
+			DirectoryCorpIDField: map[string]any{
+				"type":        "string",
+				"title":       "Directory enterprise ID",
+				"description": "Optional enterprise ID for resolving private conversation names.",
+			},
+			DirectorySecretField: map[string]any{
+				"type":        "string",
+				"title":       "Directory application secret",
+				"description": "Optional secret for a WeCom internal application that can read member names.",
+				"secret":      true,
+			},
 		},
 	}
 }

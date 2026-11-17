@@ -150,3 +150,7 @@ Also run the workspace `beak-channel-sdk-conformance` and `beak-channel-sdk-conf
 ## Approval details delivery
 
 Native WeCom clients may collapse the operation preview. The host sends complete redacted details before the actionable card, using the same approval request ID. The card now labels its quote area as a preview and displays that request ID. The host owns durable delivery progress and must not send an actionable card before details are acknowledged. Terminal callbacks continue updating the original card.
+
+## Private conversation names
+
+The bot’s conversation list supplies group names and any private name whose ID matches the callback. For private callbacks with an enterprise member ID, optionally configure `corp_id` and `directory_app_secret` for a WeCom internal app from the same enterprise. The application must be authorized to read the intended members’ names. The SDK matches the returned `userid` exactly, uses the name for display, and keeps the callback ID for delivery. Existing bot credentials remain sufficient for messaging.
