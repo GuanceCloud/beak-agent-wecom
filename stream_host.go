@@ -233,6 +233,12 @@ func (c Connector) processMessageFrame(ctx context.Context, runtime sdk.Runtime,
 	}
 
 	inbound := buildInboundMessage(runtime, accountUUID, message, chatType, chatID, text, dedupeKey)
+	if lookup := nativeRuntime(runtime.Native).ConversationDisplayName; lookup != nil {
+		inbound.ChatIdentity.DisplayName = lookup(chatType, chatID)
+		if chatType == sdk.ChatTypeDirect {
+			inbound.SenderDisplayName = inbound.ChatIdentity.DisplayName
+		}
+	}
 	inbound.Attachments = attachments
 	if len(attachmentErrors) > 0 {
 		inbound.Raw["attachment_errors"] = attachmentErrors

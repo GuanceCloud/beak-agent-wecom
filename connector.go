@@ -39,11 +39,12 @@ var outboundSendLocks [64]sync.Mutex
 
 var ErrCredentialLogin = errors.New("wecom connector uses credential login; create channel account from CredentialSchema")
 
-// NativeRuntime is an optional test/deployment override. Production callers
-// normally leave it empty and use the official WeCom WebSocket endpoint.
+// NativeRuntime contains optional WeCom-specific runtime configuration.
 type NativeRuntime struct {
 	WebSocketURL string
 	Dialer       *websocket.Dialer
+	// ConversationDisplayName supplies cached names scoped to this bot account.
+	ConversationDisplayName func(chatType, chatID string) string
 }
 
 type Connector struct{ channel Channel }
